@@ -47,24 +47,25 @@ class AttentionConv(nn.Module):
     def forward(self, x, abs_x, deg, idx):
         batch, channels, npoints, neighbors = x.size() # B, C, N, K
 
-        ''' 1. get point features (B, C, N) '''
+        ''' 1. local operation '''
+        ''' 1.1. get point features (B, C, N) '''
         x_q = abs_x # B, C//2, N, 1
         x_kv = x # B, C, N, K
 
-        ''' 2. transform by Wq, Wk, Wv '''
+        ''' 1.2. transform by Wq, Wk, Wv '''
         q_out = self.query_conv(x_q) # B, C, N, 1
         k_out = self.key_conv(x_kv) # B, C, N, K
         k_out_all = k_out[:,:,:,0] # B, C, N, 1
         v_out = self.value_conv(x_kv) # B, C, N, K
         v_out_all = v_out[:,:,:,0] # B, C, N, 1
 
-        ''' 3. relative positional encoding ''' 
+        ''' 1.3. relative positional encoding ''' 
         if self.rpe:
             k_out = k_out + self.rel_k 
   
         # k_out : B, C, N, K / self.rel_k : C, 1, K
 
-        ''' 4. multi-head attention '''
+        ''' 1.4. multi-head attention '''
         if self.scale:
             scaler = torch.tensor([self.out_channels / self.groups]).cuda()
             out = torch.rsqrt(scaler) * q_out * k_out
@@ -73,17 +74,12 @@ class AttentionConv(nn.Module):
 
         out = F.softmax(out, dim=-1) # B, C, N, K
 
-        ''' 5. scoring '''
+        ''' 2. non-local operation '''
         idx = idx[:,:,:,-1].unsqueeze(1).expand_as(out).cuda() # B, N, K -> B, 1, N, K -> B, C, N, K
         idx_scatter = torch.zeros(batch, self.out_channels, npoints, npoints, device='cuda').detach() # B, C, N, N
 
         # node-wise importance
         idx_scatter.scatter_(dim=3, index=idx, src=out)[0,0,0,:] # B,C,N,N -> B,C,N,1            
-        #score = idx_scatter.sum(dim=2, keepdim=True).transpose(2,3).repeat(1,1,1,npoints) # B, C, 1, N -> B, C, N, 1 -> B, C, N, N
-
-        #idx_key, idx_salient = score.topk(k=int(1024/16), dim=-1) # B, C, N, S | here, S : sampled global points
-
-
         score = idx_scatter.sum(dim=2, keepdim=True).transpose(2,3).squeeze(3) # B, C, 1, N -> B, C, N, 1 -> B, C, N 
 
         idx_key, idx_salient = score.topk(k=20, dim=-1) # B, C, S | here, S : sampled global points
@@ -95,9 +91,6 @@ class AttentionConv(nn.Module):
         out_all = F.softmax(out_all, dim=-1) # B, C, N, S 
         out_all = torch.einsum('bcns,bcns -> bcn', out_all, v_out_all) # B, C, N
         out_all = out_all.view(batch, -1, npoints, 1) # B, C, N, 1
-      
-        # x : 6 x 3  /  idx : 6
-        # x : B,C,N x K / idx : B,C,N,K
 
         out = torch.einsum('bcnk,bcnk -> bcn', out, v_out) # b, C, N, K
         out = out.view(batch, -1, npoints, 1) # b, C, N, 1
