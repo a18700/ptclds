@@ -1,0 +1,339 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+@Author: Yue Wang
+@Contact: yuewangx@mit.edu
+@File: model.py
+@Time: 2018/10/13 6:35 PM
+"""
+
+
+import os
+import sys
+import copy
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pdb
+
+from PI_ptcld import *
+from .attention_w13 import AttentionConv, MemoryAttentionConv
+
+
+def knn(x, k):
+    inner = -2*torch.matmul(x.transpose(2, 1), x)
+    xx = torch.sum(x**2, dim=1, keepdim=True)
+    pairwise_distance = -xx - inner - xx.transpose(2, 1)
+    idx = pairwise_distance.topk(k=k, dim=-1)[1]   # (batch_size, num_points, k)
+
+    return idx
+
+def get_graph_feature(x, k=20, idx=None):
+    batch_size = x.size(0)
+    num_points = x.size(2)
+    x = x.view(batch_size, -1, num_points) # B, C, N
+
+    if idx is None:
+        idx = knn(x, k=k)   # B, N, K
+
+    device = torch.device('cuda')
+    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1)*num_points # 1, 1, 1
+
+    idx = idx + idx_base # 1, 1024, 20
+
+    _, num_dims, _ = x.size() # 3
+    x = x.transpose(2, 1).contiguous() # 1, 1024, 3
+
+    idx = idx.view(-1)
+
+    feature = x.view(batch_size*num_points, -1)[idx, :] # 1024*20, 3
+    feature = feature.view(batch_size, num_points, k, num_dims) # 1, 1024, 20, 3
+
+    x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1) # 1, 1024, 20, 3
+    feature = torch.cat((feature-x, x), dim=3).permute(0, 3, 1, 2) # 1, 6, 1024, 20
+
+    return feature
+
+def get_neighbors(x, k=20, idx=None, deg=True, delta=True, neighbors=True, bn=None, ape=None, ptcld=None, static=False, layer=0):
+    batch_size = x.size(0)
+    num_points = x.size(2)
+    x = x.view(batch_size, -1, num_points)
+
+
+    if static is False:
+        idx = knn(x, k=k)   # (batch_size, num_points, k)
+        idx_return = idx.unsqueeze(3)
+    else:
+        idx = knn(x, k=k)   # (batch_size, num_points, k)
+        idx_initial = idx
+
+
+    device = torch.device('cuda')
+    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1)*num_points # 1, 1, 1
+
+    idx = idx + idx_base # B, N, K
+
+    _, num_dims, _ = x.size() # 3
+    x = x.transpose(2, 1).contiguous() # B, N, C
+
+    #########################################
+
+    #########################################
+    # degree distribution 
+    if deg:
+        degree_distrib = torch.zeros(batch_size, 1024).cuda() # batch, npoints
+        idx = idx.view(idx.shape[0], -1)
+        for m in range(batch_size):
+            degree_distrib[m] = torch.histc(idx[m], bins=1024, min=1024*(m), max=1024*(m+1)-1)
+        degree = degree_distrib.unsqueeze(2) # B, N, 1
+        #degree = torch.log(degree)
+
+        degree = bn(degree)
+        #x = torch.cat((x, degree), dim=2) # B, N, C+1
+        abs_x = torch.cat((x, degree), dim=2) # B, N, C+1
+        abs_x = abs_x.permute(0,2,1).unsqueeze(3)
+    else:
+        abs_x = x.permute(0,2,1).unsqueeze(3)
+        degree = None
+    #########################################
+
+    idx = idx.view(-1)
+
+    feature = x.view(batch_size*num_points, -1)[idx, :] # 1024*20, 3
+    feature = feature.view(batch_size, num_points, k, -1).permute(0, 3, 1, 2) # 1, 3, 1024, 20
+
+    if delta and neighbors:
+        if deg:
+            x = x.view(batch_size, num_points, 1, -1).repeat(1, 1, k, 1).permute(0, 3, 1, 2) # 1, 1024, 20, 3
+
+        else:
+            x = x.view(batch_size, num_points, 1, -1).repeat(1, 1, k, 1).permute(0, 3, 1, 2) # 1, 1024, 20, 3
+            feature = torch.cat((feature-x, feature), dim=1) # 1, 6, 1024, 20
+
+    elif delta and not neighbors:
+        x = x.view(batch_size, num_points, 1, -1).repeat(1, 1, k, 1).permute(0, 3, 1, 2) # 1, 1024, 20, 3
+        feature = torch.cat((feature-x, x), dim=1) # 1, 6, 1024, 20
+
+        #if deg:
+            #feature = torch.cat((feature[:,:num_dims,:,:],feature[:,num_dims+1:,:,:]), dim=1)
+
+
+    if static is True:
+        return feature, abs_x, degree, idx_initial
+    else:
+        return feature, abs_x, degree, idx_return
+
+
+
+
+
+class DGCNN_TemporalTransformer(nn.Module):
+    def __init__(self, args, output_channels=40):
+        super(DGCNN_TemporalTransformer, self).__init__()
+
+        # Temporal transformer v2 includes altered linear layer.
+
+        self.args = args
+        self.k = args.k
+        self.deg = args.deg
+        self.delta = args.delta
+        self.neighbors = args.neighbors
+        self.rpe = args.rpe
+        self.ape = args.ape
+        self.scale = args.scale
+        self.dimkqv = args.dimkqv
+
+        print("self.deg : {}".format(self.deg))
+        print("self.delta : {}".format(self.delta))
+        print("self.neighbors : {}".format(self.neighbors))
+        print("self.rpe : {}".format(self.rpe))
+        print("self.ape : {}".format(self.ape))
+        print("self.scale : {}".format(self.scale))
+        
+        self.bn0 = nn.BatchNorm2d(self.dimkqv)
+        self.bn1 = nn.BatchNorm2d(self.dimkqv)
+        self.bn2 = nn.BatchNorm2d(2*self.dimkqv)
+        self.bn3 = nn.BatchNorm2d(2*self.dimkqv)
+        self.bn4 = nn.BatchNorm2d(2*self.dimkqv)
+        self.bn5 = nn.BatchNorm1d(args.emb_dims)
+
+        if self.deg:
+            self.deg_bn1 = nn.BatchNorm1d(1024)
+            self.deg_bn2 = nn.BatchNorm1d(1024)
+            self.deg_bn3 = nn.BatchNorm1d(1024)
+            self.deg_bn4 = nn.BatchNorm1d(1024)
+        else:
+            self.deg_bn1 = None
+            self.deg_bn2 = None
+            self.deg_bn3 = None
+            self.deg_bn4 = None 
+
+        
+        if self.ape:
+            # self.pos_nn1 is skipped 
+            self.pos_nn2 = nn.Sequential(nn.Conv2d(3, 32, kernel_size=1, bias=False),
+                                     nn.BatchNorm2d(32),
+                                     nn.Tanh(),
+                                     nn.Conv2d(32, 64, kernel_size=1, bias=False),
+                                     nn.BatchNorm2d(64)) # B, 3, N, 1 -> B, C, N, 1
+
+            self.pos_nn3 = nn.Sequential(nn.Conv2d(3, 32, kernel_size=1, bias=False),
+                                     nn.BatchNorm2d(32),
+                                     nn.Tanh(),
+                                     nn.Conv2d(32, 64, kernel_size=1, bias=False),
+                                     nn.BatchNorm2d(64)) # B, 3, N, 1 -> B, C, N, 1
+
+            self.pos_nn4 = nn.Sequential(nn.Conv2d(3, 32, kernel_size=1, bias=False),
+                                     nn.BatchNorm2d(32),
+                                     nn.Tanh(),
+                                     nn.Conv2d(32, 128, kernel_size=1, bias=False),
+                                     nn.BatchNorm2d(128)) # B, 3, N, 1 -> B, C, N, 1
+        else:
+            self.pos_nn2 = None
+            self.pos_nn3 = None
+            self.pos_nn4 = None                          
+                                  
+
+        if self.deg == False and self.delta == True:
+            ''' concentrate on delta == True option '''
+            print("3")
+
+            # 1st layer
+            # Wq, Wk, Wv : C x 3
+            # q_query : B, C, N, 1
+            # k_query, v_query : B, C, N, K
+            # y : B, C, N
+
+            # 2nd layer
+            # Wq, Wk, Wv : C x C
+            # q_query : B, C, N, 1
+            # k_query, v_query : B, C, N, K
+            # k_memory, v_memory : B, C, N, K
+            # y : B, 2C, N
+
+            # ...
+
+            # ith layer
+            # Wq, Wk, Wv : C x 2C
+            # q_query : B, C, N, 1
+            # k_query, v_query : B, C, N, K
+            # k_memory, v_memory : B, C, N, K
+            # y : B, 2C, N
+
+            # first * for added channels
+            # second * for doubling features
+
+            self.conv1 = AttentionConv(3*2, self.dimkqv, kernel_size=self.k, groups=8, rpe=self.rpe, scale=self.scale, return_kv=True, layer=0, deg=self.deg)
+            self.pool1 = nn.LeakyReLU(negative_slope=0.2)
+
+            self.conv2 = MemoryAttentionConv(self.dimkqv*2, self.dimkqv, kernel_size=self.k, groups=8, rpe=self.rpe, scale=self.scale, layer=1, deg=self.deg)
+            self.pool2 = nn.LeakyReLU(negative_slope=0.2)
+
+            self.conv3 = MemoryAttentionConv(self.dimkqv*2*2, self.dimkqv, kernel_size=self.k, groups=8, rpe=self.rpe, scale=self.scale, layer=2, deg=self.deg)
+            self.pool3 = nn.LeakyReLU(negative_slope=0.2)
+
+            self.conv4 = MemoryAttentionConv(self.dimkqv*2*2, self.dimkqv, kernel_size=self.k, groups=8, rpe=self.rpe, scale=self.scale, layer=3, deg=self.deg)
+            self.pool4 = nn.LeakyReLU(negative_slope=0.2)
+
+
+        self.conv5 = nn.Sequential(nn.Conv1d(self.dimkqv*2, args.emb_dims, kernel_size=1, bias=False),
+                                   self.bn5,
+                                   nn.LeakyReLU(negative_slope=0.2)) # 64 + 64 + 128 + 256 = 512
+
+        self.linear1 = nn.Linear(args.emb_dims, 512, bias=False)
+        self.bn6 = nn.BatchNorm1d(512)
+        self.dp1 = nn.Dropout(p=args.dropout)
+
+        self.linear2 = nn.Linear(512, 256)
+        self.bn7 = nn.BatchNorm1d(256)
+        self.dp2 = nn.Dropout(p=args.dropout)
+
+        self.linear3 = nn.Linear(256, output_channels)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+
+        # shape of x : batch, feature, npoints, neighbors
+        # convolution(shared mlp to xi, xj-xi & max)
+        # =>
+        # transformer(shared wq, wk, wv to xi)
+
+        if self.ape:
+            ptcld = x
+        else:
+            ptcld = None
+
+
+        # att layer 1
+        x, abs_x, deg, idx1 = get_neighbors(x, k=self.k, deg=self.deg, delta=self.delta, neighbors=self.neighbors, bn=self.deg_bn1, layer=0) # b, 64, 1024, 20
+
+        idx = idx1 # b, n, k, 1
+
+        x1, k1, v1, s1 = self.conv1(x, abs_x, deg, idx) # b, 64, 1024
+        x1 = self.bn1(x1) # b, 64, 1024, 1
+        x1 = self.pool1(x1) # b, 64, 1024, 1
+        x1 = x1.squeeze(3) # b, 64, 1024
+
+        k = k1 # b, 64, 1024, 20, 1
+        v = v1 # b, 64, 1024, 20, 1
+        s = s1 # b, g, n, 1
+
+
+        # att - memory layer 1
+        x, abs_x, deg, idx2 = get_neighbors(x1, k=self.k, deg=self.deg, delta=self.delta, neighbors=self.neighbors, bn=self.deg_bn2, ape=self.pos_nn2, ptcld=ptcld, layer=1) # b, 128, 1024, 20
+
+        idx = torch.cat((idx, idx2), dim = 3) # b, n, k, 2
+
+        x2, k2, v2, s2 = self.conv2(x, k, v, s, abs_x, deg, idx) # b, 64, 1024, 1 / b, 64, 1024, 20 / b, 64, 1024, 20
+        x2 = self.bn2(x2) # b, 64, 1024, 1
+        x2 = self.pool2(x2) # b, 64, 1024, 1
+        x2 = x2.squeeze(3) # b, 64, 1024
+
+        k = torch.cat((k, k2), dim = 4) # b, 64, 1024, 20, 2
+        v = torch.cat((v, v2), dim = 4) # b, 64, 1024, 20, 2
+        s = torch.cat((s, s2), dim = 3) # b, g, n, 2
+
+
+        # att - memory layer 2
+        x, abs_x, deg, idx3 = get_neighbors(x2, k=self.k, deg=self.deg, delta=self.delta, neighbors=self.neighbors, bn=self.deg_bn3, ape=self.pos_nn3, ptcld=ptcld, layer=2) # b, 128, 1024, 20
+
+        idx = torch.cat((idx, idx3), dim = 3) # b, n, k, 3
+
+        x3, k3, v3, s3 = self.conv3(x, k, v, s, abs_x, deg, idx) # b, 64, 1024, 1
+
+        x3 = self.bn3(x3) # b, 64, 1024, 1
+        x3 = self.pool3(x3) # b, 64, 1024, 1
+        x3 = x3.squeeze(3) # b, 64, 1024
+
+        k = torch.cat((k, k3), dim = 4) # b, 64, 1024, 20, 3
+        v = torch.cat((v, v3), dim = 4) # b, 64, 1024, 20, 3
+        s = torch.cat((s, s3), dim = 3) # b, g, n, 3
+
+
+        # att - memory layer 3
+        x, abs_x, deg, idx4 = get_neighbors(x3, k=self.k, deg=self.deg, delta=self.delta, neighbors=self.neighbors, bn=self.deg_bn4, ape=self.pos_nn4, ptcld=ptcld, layer=3) # b, 64, 1024, 20
+
+        idx = torch.cat((idx, idx4), dim = 3) # b, n, k, 3
+
+        x4, k4, v4, s4 = self.conv4(x, k, v, s, abs_x, deg, idx) # b, 64, 1024, 20
+        x4 = self.bn4(x4) # b, 64, 1024, 1
+        x4 = self.pool4(x4) # b, 64, 1024, 1
+        x4 = x4.squeeze(3) # b, 64, 1024
+
+        # not concat and adaptive pooling
+        x = self.conv5(x4) # b, 256, 1024
+        #print(x.shape)
+        x = F.adaptive_max_pool1d(x, 1).view(batch_size, -1)
+        #print(x.shape)
+        x = F.leaky_relu(self.bn6(self.linear1(x)), negative_slope=0.2)
+        x = self.dp1(x)
+
+        x = F.leaky_relu(self.bn7(self.linear2(x)), negative_slope=0.2)
+        x = self.dp2(x)
+        x = self.linear3(x)
+
+        return x
+
+
